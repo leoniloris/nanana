@@ -1,7 +1,13 @@
 {
-  "version": 1,
-  "kdf": "PBKDF2-HMAC-SHA256",
-  "iterations": 200000,
-  "salt": "x7TZRmI8lRLRbsXD2kZZ4w==",
+  "version": 2,
+  "kdf": "argon2id",
+  "salt": "MnDi/jzaWrts1gVHjHzTBw==",
+  "argon2": {
+    "t": 3,
+    "m": 65536,
+    "p": 1,
+    "hashLen": 32,
+    "version": 19
+  },
   "manifest": "manifest.enc"
 }
