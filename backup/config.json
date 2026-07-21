@@ -1,7 +1,7 @@
 {
   "version": 2,
   "kdf": "argon2id",
-  "salt": "VxQpWpDvOLvVrs8pvvdHmw==",
+  "salt": "3nt83KnvpqQuHyl1r2wrZA==",
   "argon2": {
     "t": 3,
     "m": 65536,
