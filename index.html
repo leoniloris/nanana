@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Photos</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='14' font-size='14'%3E%F0%9F%94%92%3C/text%3E%3C/svg%3E">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' data: blob:">
+
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font: 14px/1.4 system-ui, sans-serif;
+    background: #0e0e10; color: #eee;
+  }
+  #gate {
+    position: fixed; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 12px; background: #0e0e10;
+    z-index: 20;
+  }
+  #gate input {
+    padding: 10px 14px; font-size: 16px; border-radius: 8px; border: 1px solid #333;
+    background: #1a1a1e; color: #eee; width: min(320px, 80vw);
+  }
+  #gate button {
+    padding: 10px 20px; font-size: 15px; border-radius: 8px; border: 0;
+    background: #3b82f6; color: #fff; cursor: pointer;
+  }
+  #gate .err { color: #f87171; min-height: 1em; }
+  header {
+    position: sticky; top: 0; z-index: 10; padding: 10px 14px;
+    background: rgba(14,14,16,.9); backdrop-filter: blur(8px);
+    display: flex; gap: 10px; align-items: center; border-bottom: 1px solid #222;
+  }
+  #q {
+    flex: 1; padding: 9px 12px; font-size: 15px; border-radius: 8px;
+    border: 1px solid #333; background: #1a1a1e; color: #eee;
+  }
+  #count { color: #888; white-space: nowrap; }
+  #grid {
+    display: grid; gap: 4px; padding: 4px;
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  }
+  .cell {
+    position: relative; aspect-ratio: 1; background: #1a1a1e;
+    overflow: hidden; border-radius: 4px; cursor: pointer;
+  }
+  .cell img {
+    width: 100%; height: 100%; object-fit: cover; display: block;
+    opacity: 0; transition: opacity .2s;
+  }
+  .cell img.on { opacity: 1; }
+  .cell .cap {
+    position: absolute; left: 0; right: 0; bottom: 0; padding: 3px 6px;
+    font-size: 11px; color: #ddd; background: linear-gradient(transparent, rgba(0,0,0,.7));
+    opacity: 0; transition: opacity .15s; pointer-events: none;
+  }
+  .cell:hover .cap { opacity: 1; }
+  #viewer {
+    position: fixed; inset: 0; z-index: 30; background: rgba(0,0,0,.95);
+    display: none; align-items: center; justify-content: center; flex-direction: column;
+  }
+  #viewer.on { display: flex; }
+  #viewer img { max-width: 96vw; max-height: 86vh; object-fit: contain; }
+  #viewer .meta { color: #bbb; padding: 10px; font-size: 13px; text-align: center; }
+  #viewer .close { position: absolute; top: 14px; right: 18px; font-size: 28px; cursor: pointer; }
+</style>
+</head>
+<body>
+  <div id="gate">
+    <div style="font-size:20px">🔒 Photos</div>
+    <input id="pw" type="password" placeholder="Password" autofocus>
+    <button id="unlock">Unlock</button>
+    <div class="err" id="err"></div>
+  </div>
+
+  <header hidden id="bar">
+    <input id="q" placeholder="Fuzzy search: place, date, camera, keywords…">
+    <span id="count"></span>
+  </header>
+  <div id="grid"></div>
+
+  <div id="viewer">
+    <div class="close" id="vclose">✕</div>
+    <img id="vimg" alt="">
+    <div class="meta" id="vmeta"></div>
+  </div>
+
+  <script>
+"use strict";
+/* Thingy viewer — decrypts an AES-256-GCM photo backup in the browser.
+   Zero dependencies. Thumbnails are decrypted lazily as they scroll into view;
+   full images only on click. The password never leaves the page. */
+// Encrypted data lives in ./backup next to this page (same repo). GitHub Pages
+// at the repo root serves both, so this relative path just works.
+const BASE = "backup/";
+const IT = 200000, NONCE = 12;
+let KEY = null;          // derived CryptoKey
+let ITEMS = [];          // manifest entries
+let VIEW = [];           // currently filtered entries
+const urlCache = new Map();   // id -> object URL for its thumbnail
+const $ = (id) => document.getElementById(id);
+// ---- crypto ---------------------------------------------------------------
+async function deriveKey(password, saltB64, iterations) {
+  const salt = Uint8Array.from(atob(saltB64), (c) => c.charCodeAt(0));
+  const base = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt, iterations, hash: "SHA-256" },
+    base, { name: "AES-GCM", length: 256 }, false, ["decrypt"]);
+}
+async function decryptBlob(buf) {
+  const bytes = new Uint8Array(buf);
+  const iv = bytes.subarray(0, NONCE);
+  const ct = bytes.subarray(NONCE);
+  return crypto.subtle.decrypt({ name: "AES-GCM", iv }, KEY, ct);
+}
+async function fetchDecrypt(path) {
+  const r = await fetch(BASE + path);
+  if (!r.ok) throw new Error("fetch " + path + " -> " + r.status);
+  return decryptBlob(await r.arrayBuffer());
+}
+// ---- concurrency-limited thumbnail decode ---------------------------------
+let active = 0;
+const queue = [];
+function schedule(task) {
+  return new Promise((resolve) => {
+    queue.push({ task, resolve });
+    pump();
+  });
+}
+function pump() {
+  while (active < 6 && queue.length) {
+    const { task, resolve } = queue.shift();
+    active++;
+    task().then(resolve).catch(() => resolve(null)).finally(() => {
+      active--;
+      pump();
+    });
+  }
+}
+async function thumbUrl(item) {
+  if (urlCache.has(item.id)) return urlCache.get(item.id);
+  const url = await schedule(async () => {
+    const plain = await fetchDecrypt(item.thumb);
+    return URL.createObjectURL(new Blob([plain], { type: "image/jpeg" }));
+  });
+  if (url) urlCache.set(item.id, url);
+  return url;
+}
+// ---- fuzzy search ---------------------------------------------------------
+function haystack(it) {
+  return [it.filename, it.place, it.camera, (it.date || "").slice(0, 10),
+          ...(it.objects || []), ...(it.people || []),
+          ...(it.keywords || [])].filter(Boolean).join(" ").toLowerCase();
+}
+// subsequence match with a contiguity bonus; higher is better, -1 = no match
+function fuzzyScore(hay, needle) {
+  if (!needle) return 0;
+  let score = 0, hi = 0, run = 0;
+  for (const ch of needle) {
+    const found = hay.indexOf(ch, hi);
+    if (found === -1) return -1;
+    run = found === hi ? run + 1 : 0;
+    score += 1 + run;      // reward consecutive hits
+    hi = found + 1;
+  }
+  return score;
+}
+function search(query) {
+  const q = query.trim().toLowerCase();
+  if (!q) { VIEW = ITEMS; render(); return; }
+  const scored = [];
+  for (const it of ITEMS) {
+    const s = fuzzyScore(it._hay, q);
+    if (s >= 0) scored.push([s, it]);
+  }
+  scored.sort((a, b) => b[0] - a[0]);
+  VIEW = scored.map((x) => x[1]);
+  render();
+}
+// ---- rendering ------------------------------------------------------------
+const observer = new IntersectionObserver((entries) => {
+  for (const e of entries) {
+    if (!e.isIntersecting) continue;
+    const cell = e.target;
+    observer.unobserve(cell);
+    const item = cell._item;
+    thumbUrl(item).then((url) => {
+      if (!url) return;
+      const img = cell.querySelector("img");
+      img.src = url;
+      img.onload = () => img.classList.add("on");
+    });
+  }
+}, { rootMargin: "400px" });
+function render() {
+  const grid = $("grid");
+  grid.textContent = "";
+  const frag = document.createDocumentFragment();
+  for (const it of VIEW) {
+    const cell = document.createElement("div");
+    cell.className = "cell";
+    cell._item = it;
+    const img = document.createElement("img");
+    img.loading = "lazy";
+    if (urlCache.has(it.id)) { img.src = urlCache.get(it.id); img.classList.add("on"); }
+    const cap = document.createElement("div");
+    cap.className = "cap";
+    cap.textContent = it.place || (it.date || "").slice(0, 10) || it.filename;
+    cell.append(img, cap);
+    cell.onclick = () => openViewer(it);
+    frag.appendChild(cell);
+    if (!urlCache.has(it.id)) observer.observe(cell);
+  }
+  grid.appendChild(frag);
+  $("count").textContent = VIEW.length + " / " + ITEMS.length;
+}
+// ---- full-image viewer ----------------------------------------------------
+async function openViewer(it) {
+  const v = $("viewer");
+  v.classList.add("on");
+  const vimg = $("vimg");
+  vimg.removeAttribute("src");
+  const people = (it.people && it.people.length) ? it.people.join(", ")
+    : (it.num_people ? it.num_people + (it.num_people > 1 ? " people" : " person") : null);
+  const bits = [it.date ? it.date.slice(0, 10) : null, it.place, it.camera,
+    people, (it.objects || []).join(", ")].filter(Boolean);
+  $("vmeta").textContent = bits.join("  ·  ");
+  try {
+    const plain = await fetchDecrypt(it.full);
+    vimg.src = URL.createObjectURL(new Blob([plain], { type: it.mime || "image/jpeg" }));
+  } catch (e) {
+    $("vmeta").textContent = "Failed to decrypt image.";
+  }
+}
+function closeViewer() {
+  $("viewer").classList.remove("on");
+  const vimg = $("vimg");
+  if (vimg.src.startsWith("blob:")) URL.revokeObjectURL(vimg.src);
+}
+// ---- boot -----------------------------------------------------------------
+async function unlock() {
+  const pw = $("pw").value;
+  if (!pw) return;
+  $("err").textContent = "Decrypting…";
+  try {
+    const cfg = await (await fetch(BASE + "config.json")).json();
+    KEY = await deriveKey(pw, cfg.salt, cfg.iterations || IT);
+    const manifestPath = cfg.manifest || "manifest.enc";
+    const plain = await fetchDecrypt(manifestPath);
+    const data = JSON.parse(new TextDecoder().decode(plain));
+    ITEMS = data.items || [];
+    for (const it of ITEMS) it._hay = haystack(it);
+    VIEW = ITEMS;
+    $("gate").style.display = "none";
+    $("bar").hidden = false;
+    render();
+  } catch (e) {
+    $("err").textContent = "Wrong password (or no backup found).";
+  }
+}
+$("unlock").onclick = unlock;
+$("pw").addEventListener("keydown", (e) => { if (e.key === "Enter") unlock(); });
+$("q").addEventListener("input", (e) => search(e.target.value));
+$("vclose").onclick = closeViewer;
+$("viewer").addEventListener("click", (e) => { if (e.target.id === "viewer") closeViewer(); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeViewer(); });
+</script>
+</body>
+</html>

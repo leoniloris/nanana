@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "kdf": "PBKDF2-HMAC-SHA256",
+  "iterations": 200000,
+  "salt": "x7TZRmI8lRLRbsXD2kZZ4w==",
+  "manifest": "manifest.enc"
+}
